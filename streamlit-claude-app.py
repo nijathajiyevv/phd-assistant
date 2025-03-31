@@ -1,16 +1,10 @@
 import streamlit as st
 import os
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
+import numpy as np
+import re
 from PyPDF2 import PdfReader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.vectorstores import FAISS
-from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.chains.question_answering import load_qa_chain
-from langchain.llms import Anthropic
-import faiss
-import re
 import anthropic
 from collections import Counter
 import altair as alt
@@ -50,11 +44,10 @@ def extract_years(text):
     return [int(year) for year in years]
 
 # Function to extract publication details using Claude
-def extract_publication_details(client, text_chunks, num_publications=25):
-    publications = []
-    
-    # Combine some chunks for context (adjust as needed)
-    combined_text = " ".join(text_chunks[:10])
+def extract_publication_details(client, text, num_publications=25):
+    # Use a shorter text if it's too long
+    if len(text) > 10000:
+        text = text[:10000]
     
     prompt = f"""
     Based on the following academic text, extract information about {num_publications} most valuable publications mentioned.
@@ -69,81 +62,98 @@ def extract_publication_details(client, text_chunks, num_publications=25):
     Format as a table with these columns. If any information is not available, write "N/A".
     
     TEXT:
-    {combined_text}
+    {text}
     """
     
-    response = client.messages.create(
-        model="claude-3-5-sonnet-20240620",
-        max_tokens=4000,
-        messages=[
-            {"role": "user", "content": prompt}
-        ]
-    )
-    
-    # Parse the table from response
-    result = response.content[0].text
-    
-    # You'll need to parse the table format from Claude's response
-    # This is a simplified approach - you might need to improve it
-    lines = result.strip().split('\n')
-    headers = []
-    
-    for i, line in enumerate(lines):
-        if '|' in line:
-            if not headers:
-                headers = [h.strip() for h in line.split('|')[1:-1]]
-            else:
-                cells = [c.strip() for c in line.split('|')[1:-1]]
-                if len(cells) == len(headers) and not all(c.startswith('-') for c in cells):
-                    pub = {headers[j]: cells[j] for j in range(len(headers))}
-                    publications.append(pub)
-    
-    return publications
+    try:
+        response = client.messages.create(
+            model="claude-3-5-sonnet-20240620",
+            max_tokens=4000,
+            messages=[
+                {"role": "user", "content": prompt}
+            ]
+        )
+        
+        # Parse the table from response
+        result = response.content[0].text
+        
+        # Create a list to store the publications
+        publications = []
+        
+        # Simple parsing based on markdown table format
+        lines = result.strip().split('\n')
+        headers = []
+        
+        for i, line in enumerate(lines):
+            if '|' in line:
+                # Extract header row
+                if not headers and i < len(lines) - 1 and '---' in lines[i+1]:
+                    headers = [h.strip() for h in line.split('|') if h.strip()]
+                # Extract data rows
+                elif headers and not line.strip().startswith('|---'):
+                    cells = [c.strip() for c in line.split('|') if c.strip()]
+                    if len(cells) >= len(headers):
+                        pub = {headers[j]: cells[j] for j in range(len(headers))}
+                        publications.append(pub)
+        
+        return publications
+    except Exception as e:
+        st.error(f"Error extracting publications: {e}")
+        return []
 
 # Function to classify studies by methodology
-def classify_by_methodology(client, text_chunks):
-    # Combine some chunks for context
-    combined_text = " ".join(text_chunks[:15])
+def classify_by_methodology(client, text):
+    # Use a shorter text if it's too long
+    if len(text) > 10000:
+        text = text[:10000]
     
     prompt = f"""
     Based on the following academic text, classify the studies mentioned by methodology.
     Create a summary of how many papers used each methodology (e.g., 60 papers used surveys, 25 used experiments, etc.)
     
     TEXT:
-    {combined_text}
+    {text}
     """
     
-    response = client.messages.create(
-        model="claude-3-5-sonnet-20240620",
-        max_tokens=1000,
-        messages=[
-            {"role": "user", "content": prompt}
-        ]
-    )
-    
-    # Parse the response to extract methodology counts
-    result = response.content[0].text
-    
-    # This is a simplified approach - you might need custom parsing logic
-    methodologies = {}
-    lines = result.strip().split('\n')
-    
-    for line in lines:
-        if ':' in line:
-            parts = line.split(':')
-            if len(parts) == 2:
-                method = parts[0].strip()
-                count_match = re.search(r'\d+', parts[1])
-                if count_match:
-                    count = int(count_match.group())
-                    methodologies[method] = count
-    
-    return methodologies
+    try:
+        response = client.messages.create(
+            model="claude-3-5-sonnet-20240620",
+            max_tokens=1000,
+            messages=[
+                {"role": "user", "content": prompt}
+            ]
+        )
+        
+        # Parse the response to extract methodology counts
+        result = response.content[0].text
+        
+        # This is a simplified approach - assuming Claude returns a list
+        methodologies = {}
+        lines = result.strip().split('\n')
+        
+        for line in lines:
+            # Look for patterns like "X papers used Y" or "Y: X papers"
+            match1 = re.search(r'(\d+)\s+(?:papers|studies)\s+(?:used|employed|utilized)\s+([^:.,]+)', line)
+            match2 = re.search(r'([^:.,]+):\s*(\d+)', line)
+            
+            if match1:
+                count = int(match1.group(1))
+                method = match1.group(2).strip()
+                methodologies[method] = count
+            elif match2:
+                method = match2.group(1).strip()
+                count = int(match2.group(2))
+                methodologies[method] = count
+        
+        return methodologies
+    except Exception as e:
+        st.error(f"Error classifying methodologies: {e}")
+        return {}
 
 # Streamlit App
 def main():
     st.header('🌿 AI agent for Doctoral Students: Chat with Academic Papers 💬')
-    st.sidebar.title('📚 LLM ChatApp using Claude & LangChain')
+    st.sidebar.title('📚 LLM ChatApp using Claude API')
     
     key = st.text_input("Insert your Anthropic API key", type="password")
     
@@ -169,31 +179,17 @@ def main():
                 pdf_reader = PdfReader(pdf)
                 text = ""
                 for page in pdf_reader.pages:
-                    text += page.extract_text()
+                    page_text = page.extract_text()
+                    if page_text:  # Check if text extraction was successful
+                        text += page_text
                 
-                # Split text into chunks
-                text_splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=1000,
-                    chunk_overlap=200,
-                    length_function=len
-                )
-                chunks = text_splitter.split_text(text=text)
+                if not text:
+                    st.error("Could not extract text from the PDF. Please try a different file.")
+                    return
                 
                 # Store name based on PDF name
                 store_name = pdf.name[:-4]
                 st.write(f"Processing: {store_name}")
-                
-                # Use HuggingFace embeddings since we're not using OpenAI
-                embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-                
-                # Check if embeddings exist, otherwise create them
-                if os.path.exists(f"{store_name}.faiss"):
-                    vector_store = FAISS.load_local(store_name, embeddings)
-                    st.success('Embeddings Loaded from FAISS file')
-                else:
-                    vector_store = FAISS.from_texts(chunks, embeddings)
-                    vector_store.save_local(store_name)
-                    st.success('Embeddings Created and Saved')
                 
                 # Create tabs for different functionalities
                 tab1, tab2, tab3, tab4 = st.tabs(["Chat with PDF", "Publication Years", "Top Publications", "Methodology Analysis"])
@@ -204,31 +200,28 @@ def main():
                     
                     if query:
                         with st.spinner("Generating answer..."):
-                            # Get relevant documents
-                            docs = vector_store.similarity_search(query=query, k=3)
-                            
-                            # Extract content from docs
-                            doc_content = "\n".join([doc.page_content for doc in docs])
-                            
-                            # Use Claude to answer
+                            # Use Claude to answer directly from the text
                             prompt = f"""
                             Based on the following content from an academic paper, please answer this question:
                             
                             Question: {query}
                             
                             Content:
-                            {doc_content}
+                            {text[:10000]}  # Using first 10,000 chars to stay within context limits
                             """
                             
-                            response = client.messages.create(
-                                model="claude-3-5-sonnet-20240620",
-                                max_tokens=1500,
-                                messages=[
-                                    {"role": "user", "content": prompt}
-                                ]
-                            )
-                            
-                            st.write(response.content[0].text)
+                            try:
+                                response = client.messages.create(
+                                    model="claude-3-5-sonnet-20240620",
+                                    max_tokens=1500,
+                                    messages=[
+                                        {"role": "user", "content": prompt}
+                                    ]
+                                )
+                                
+                                st.write(response.content[0].text)
+                            except Exception as e:
+                                st.error(f"Error getting answer: {e}")
                 
                 with tab2:
                     st.subheader("Publications by Year")
@@ -281,7 +274,7 @@ def main():
                     
                     if st.button("Extract Publications"):
                         with st.spinner("Analyzing publications..."):
-                            publications = extract_publication_details(client, chunks, num_pubs)
+                            publications = extract_publication_details(client, text, num_pubs)
                             
                             if publications:
                                 # Convert to DataFrame
@@ -297,14 +290,14 @@ def main():
                                     mime="text/csv"
                                 )
                             else:
-                                st.warning("Could not extract publication details. Try with a different document.")
+                                st.warning("Could not extract publication details. Try a different document or check your API key.")
                 
                 with tab4:
                     st.subheader("Methodology Classification")
                     
                     if st.button("Analyze Methodologies"):
                         with st.spinner("Classifying methodologies..."):
-                            methodologies = classify_by_methodology(client, chunks)
+                            methodologies = classify_by_methodology(client, text)
                             
                             if methodologies:
                                 # Convert to DataFrame
@@ -316,13 +309,19 @@ def main():
                                 # Display as table
                                 st.dataframe(method_df, use_container_width=True)
                                 
-                                # Create pie chart
-                                fig, ax = plt.subplots(figsize=(10, 6))
-                                ax.pie(method_df['Count'], labels=method_df['Methodology'], autopct='%1.1f%%', 
-                                      startangle=90, shadow=True)
-                                ax.axis('equal')  # Equal aspect ratio ensures the pie chart is circular
+                                # Create bar chart with Altair
+                                chart = alt.Chart(method_df).mark_bar().encode(
+                                    x='Count:Q',
+                                    y=alt.Y('Methodology:N', sort='-x'),
+                                    color=alt.Color('Count:Q', scale=alt.Scale(scheme='viridis')),
+                                    tooltip=['Methodology', 'Count']
+                                ).properties(
+                                    title='Research Methodologies Used',
+                                    width=600,
+                                    height=400
+                                )
                                 
-                                st.pyplot(fig)
+                                st.altair_chart(chart, use_container_width=True)
                                 
                                 # Option to download as CSV
                                 csv = method_df.to_csv(index=False)
